@@ -1,0 +1,138 @@
+import pandas as pd
+import numpy as np
+import dash
+from dash import dcc, html, Input, Output
+import plotly.express as px
+import plotly.graph_objects as go
+
+# --- Load your data (point to the file you just made) ---
+df = pd.read_excel("synthetic_sora_and_sorafx.xlsx", sheet_name="Sheet1")
+df["Date"] = pd.to_datetime(df["Date"])
+df["Tenor"] = df["Tenor"].astype(str)
+
+# Tenor order (optional: to keep x in nice order)
+tenor_order = ["O/N","T/N","1W","2W","1M","2M","3M","6M","9M","1Y","18M","2Y"]
+df["Tenor"] = pd.Categorical(df["Tenor"], categories=tenor_order, ordered=True)
+
+app = dash.Dash(__name__)
+app.title = "SORA FX Curve – Dynamic Scale"
+
+app.layout = html.Div([
+    html.H2("SORA vs SORA_FX – Interactive Curve Dashboard"),
+
+    html.Div([
+        html.Label("Pick one or more dates"),
+        dcc.Dropdown(
+            id="date_selector",
+            options=[{"label": d.strftime("%Y-%m-%d"), "value": d.strftime("%Y-%m-%d")} for d in sorted(df["Date"].unique())],
+            value=[df["Date"].max().strftime("%Y-%m-%d")],  # default latest only
+            multi=True
+        ),
+        dcc.Checklist(
+            id="series_toggle",
+            options=[{"label":" Show SORA","value":"SORA"},{"label":" Show SORA_FX","value":"SORA_FX"}],
+            value=["SORA","SORA_FX"],
+            inline=True
+        ),
+        dcc.Checklist(
+            id="dual_axis_toggle",
+            options=[{"label":" Dual Y Axis","value":"DUAL"}],
+            value=["DUAL"],
+            inline=True
+        ),
+    ], style={"marginBottom":"10px"}),
+
+    dcc.Graph(id="curve_chart"),
+
+    html.Hr(),
+    html.H4("Day‑to‑Day Changes Heatmap (bp) — SORA_FX"),
+    dcc.Graph(id="heatmap_changes"),
+])
+
+@app.callback(
+    Output("curve_chart","figure"),
+    Input("date_selector","value"),
+    Input("series_toggle","value"),
+    Input("dual_axis_toggle","value"),
+)
+def update_curve_chart(selected_dates, series_flags, dual_axis_flag):
+    if not selected_dates:
+        return go.Figure()
+    sel = pd.to_datetime(selected_dates)
+    filtered = df[df["Date"].isin(sel)].copy()
+
+    # Compute dynamic y-axis bounds across *both* series for these dates
+    y_cols = []
+    if "SORA" in series_flags: y_cols.append("Sora")
+    if "SORA_FX" in series_flags: y_cols.append("Sora_FX")
+    if not y_cols:
+        y_cols = ["Sora","Sora_FX"]
+
+    y_min = np.nanmin(filtered[y_cols].values)
+    y_max = np.nanmax(filtered[y_cols].values)
+    pad = max(0.02, 0.05*(y_max - y_min))  # at least ~2 bps pad, or 5% of span
+    y_range = [y_min - pad, y_max + pad]
+
+    latest = filtered["Date"].max()
+    dates_sorted = sorted(filtered["Date"].unique())
+
+    fig = go.Figure()
+
+    # Style earlier vs latest
+    for d in dates_sorted:
+        dd = filtered[filtered["Date"] == d].sort_values("Tenor")
+        is_latest = (d == latest)
+        style = dict(
+            mode="lines+markers" if is_latest else "lines",
+            line=dict(width=3 if is_latest else 2, dash="solid" if is_latest else "dot"),
+            opacity=1.0 if is_latest else 0.45
+        )
+        if "SORA" in series_flags:
+            fig.add_trace(go.Scatter(
+                x=dd["Tenor"], y=dd["Sora"],
+                name=f"SORA {d.date()}",
+                yaxis="y1", **style
+            ))
+        if "SORA_FX" in series_flags:
+            fig.add_trace(go.Scatter(
+                x=dd["Tenor"], y=dd["Sora_FX"],
+                name=f"SORA_FX {d.date()}",
+                yaxis="y2" if ("DUAL" in (dual_axis_flag or []) and "SORA" in series_flags) else "y1",
+                **style
+            ))
+
+    dual = "DUAL" in (dual_axis_flag or [])
+    fig.update_layout(
+        title=f"Curves: {', '.join(pd.to_datetime(selected_dates).strftime('%Y-%m-%d'))}",
+        xaxis=dict(title="Tenor", categoryorder="array", categoryarray=tenor_order),
+        yaxis=dict(title="Rate (%)", range=y_range),
+        yaxis2=dict(title="Rate (%)", overlaying="y", side="right", range=y_range, matches=None) if (dual and "SORA" in series_flags and "SORA_FX" in series_flags) else None,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        template="plotly_white"
+    )
+    return fig
+
+@app.callback(
+    Output("heatmap_changes","figure"),
+    Input("date_selector","value")
+)
+def update_heatmap(selected_dates):
+    # Heatmap for SORA_FX day-to-day changes (bp)
+    piv = df.pivot_table(index="Date", columns="Tenor", values="Sora_FX").sort_index()
+    chg_bp = piv.diff().mul(100)  # bp
+    chg_bp = chg_bp.dropna(how="all")  # first day has NaN changes
+
+    fig = px.imshow(
+        chg_bp[tenor_order].T,  # rows=tenor, cols=date
+        origin="lower", aspect="auto",
+        color_continuous_scale="RdBu_r",
+        labels=dict(x="Date", y="Tenor", color="Δ (bp)"),
+        title="SORA_FX Day‑to‑Day Changes (bp)"
+    )
+    fig.update_layout(template="plotly_white")
+    return fig
+
+if __name__ == "__main__":
+    # Dash 3+: use app.run(...). For notebook inline, you can do: app.run(jupyter_mode="inline")
+    app.run(debug=True)

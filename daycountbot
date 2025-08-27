@@ -1,0 +1,124 @@
+import pandas as pd
+
+# --- helpers ---
+def is_business_day(ts: pd.Timestamp, holidays: pd.DatetimeIndex) -> bool:
+    return (ts.weekday() < 5) and (ts.normalize() not in holidays)
+
+def last_business_day_of_month(any_date: pd.Timestamp, holidays: pd.DatetimeIndex) -> pd.Timestamp:
+    # move to last calendar day of the month
+    d = (any_date + pd.offsets.MonthEnd(0)).normalize()
+    # step backwards to the last business day excluding holidays/weekends
+    while (d.weekday() >= 5) or (d in holidays):
+        d -= pd.Timedelta(days=1)
+    return d
+
+# --- main ---
+def compute_fx_swap_calendar_with_month_end_runs(trade_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Rules (recap):
+    - Spot = T+2 business days (US+SG holiday calendar via custom_bd)
+    - O/N: skip if T is a US holiday
+    - T/N: skip if T+1 (business day) is a US holiday; if T+2 hits a US holiday/weekend, roll forward
+    - 1W/2W: calendar days from Spot, then push to next business day if needed
+    - Monthly (1M..1Y):
+        * NEW: If Spot is the LAST BUSINESS DAY of its month, each monthly tenor ends on the LAST BUSINESS DAY of that month.
+        * Otherwise: aim for same “spot day” in target month; if weekend/holiday, roll forward within month; if that crosses month, roll backward to last biz day.
+    - Final safety: end dates must be business days.
+    """
+    tenor_offsets = {
+        'O/N': (0, '1B'),
+        'T/N': (1, '1B'),
+        'S/N': (2, '1B'),
+        '1W': (2, '7C'),
+        '2W': (2, '14C'),
+        '1M': (2, '1M'),
+        '2M': (2, '2M'),
+        '3M': (2, '3M'),
+        '6M': (2, '6M'),
+        '9M': (2, '9M'),
+        '1Y': (2, '12M'),
+    }
+
+    df = pd.DataFrame(columns=['Tenor', 'Start Date', 'End Date', 'Calendar Days'])
+
+    # Spot and month-end-run switch
+    spot_date = pd.Timestamp(trade_date + 2 * custom_bd)
+    spot_day = spot_date.day
+    spot_is_month_end_bizday = (spot_date.normalize() == last_business_day_of_month(spot_date, all_holidays))
+
+    for tenor, (start_offset, end_logic) in tenor_offsets.items():
+        # Start date uses business-day offset
+        start_date = pd.Timestamp(trade_date + start_offset * custom_bd)
+
+        # --- O/N rule: skip if T is a US holiday ---
+        if tenor == 'O/N' and trade_date.normalize() in us_holidays:
+            continue
+
+        # --- T/N rule set ---
+        if tenor == 'T/N':
+            start_tn = trade_date + 1 * custom_bd  # T+1 business day
+            if start_tn.normalize() in us_holidays:
+                # If T+1 is a US holiday, no T/N
+                continue
+            end_tn = start_tn + 1 * custom_bd      # tentative T+2 business day
+            # If T+2 hits US holiday or weekend, roll forward to next business day
+            while (end_tn.normalize() in us_holidays) or (end_tn.weekday() >= 5):
+                end_tn += pd.Timedelta(days=1)
+            end_date = pd.Timestamp(end_tn)
+            calendar_days = (end_date - start_tn).days
+            df.loc[len(df)] = [tenor, start_tn.date(), end_date.date(), calendar_days]
+            continue
+
+        # --- monthly tenors ---
+        if end_logic.endswith('M'):
+            months = int(end_logic[:-1])
+            # target month anchor (spot + months, using start_date as base per our earlier design)
+            base_month = start_date + pd.DateOffset(months=months)
+
+            if spot_is_month_end_bizday:
+                # NEW MONTH-END RUN MODE:
+                # if spot is last business day of its month, each monthly tenor ends on last business day of its target month
+                end_date = last_business_day_of_month(base_month, all_holidays)
+            else:
+                # “same-day” aim: try to place on the spot_day
+                try:
+                    desired_end = base_month.replace(day=spot_day)
+                except ValueError:
+                    # day doesn't exist (e.g., Feb 30/31) -> go to last calendar day of the month
+                    desired_end = (base_month + pd.offsets.MonthEnd(0)).normalize()
+
+                # If that lands on weekend/holiday, try rolling forward within the same month
+                if (desired_end.weekday() >= 5) or (desired_end in all_holidays):
+                    forward = desired_end
+                    while (forward.month == desired_end.month) and ((forward.weekday() >= 5) or (forward in all_holidays)):
+                        forward += pd.Timedelta(days=1)
+                    if forward.month == desired_end.month:
+                        end_date = forward
+                    else:
+                        # if rolling forward exits the month, roll backward to last business day in that month
+                        end_date = last_business_day_of_month(desired_end, all_holidays)
+                else:
+                    end_date = desired_end
+
+        # --- calendar-day tenors (1W/2W) ---
+        elif end_logic.endswith('C'):
+            days = int(end_logic[:-1])
+            end_date = start_date + pd.Timedelta(days=days)
+
+        # --- business-day tenors (O/N, S/N) ---
+        else:
+            biz_days = int(end_logic[:-1])
+            end_date = start_date + biz_days * custom_bd
+
+        # Final safety: ensure end_date is a business day (push forward if needed)
+        end_date = pd.Timestamp(end_date)
+        while (end_date.weekday() >= 5) or (end_date.normalize() in all_holidays):
+            end_date += pd.Timedelta(days=1)
+
+        calendar_days = (end_date - start_date).days
+        df.loc[len(df)] = [tenor, start_date.date(), end_date.date(), calendar_days]
+
+    # neat formatting
+    df['Start Date'] = df['Start Date'].astype(str)
+    df['End Date']   = df['End Date'].astype(str)
+    return df
